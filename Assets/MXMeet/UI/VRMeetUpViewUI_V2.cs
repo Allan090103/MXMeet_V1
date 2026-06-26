@@ -24,6 +24,7 @@ namespace MXMeet.UI
         public Button          placeAnchorButton;
         public Button          quickJoinButton;
         public Button          joinByCodeButton;
+        public Button          backButton;
         public TMP_InputField  roomCodeInput;
         public GameObject      roomCodePanel;
         public TextMeshProUGUI statusText;
@@ -48,6 +49,28 @@ namespace MXMeet.UI
             quickJoinButton.onClick.AddListener(OnQuickJoinClicked);
             joinByCodeButton.onClick.AddListener(() => roomCodePanel.SetActive(true));
             exitButton.onClick.AddListener(OnExitClicked);
+
+            if (backButton == null)
+                backButton = GameObject.Find("BackButton")?.GetComponent<Button>();
+            if (backButton != null)
+            {
+                var img = backButton.GetComponent<UnityEngine.UI.Image>();
+                if (img != null) { img.sprite = null; img.color = new Color(0.10f, 0.13f, 0.22f, 1.0f); }
+                var rt = backButton.GetComponent<RectTransform>();
+                if (rt != null) { rt.sizeDelta = new Vector2(300, 62); rt.anchoredPosition = new Vector2(0, -160); }
+                var label = backButton.GetComponentInChildren<TMPro.TextMeshProUGUI>();
+                if (label != null)
+                {
+                    label.text = "← Back to Menu";
+                    label.color = new Color(0.92f, 0.96f, 1.0f, 1.0f);
+                    label.fontSize = 22;
+                    label.fontStyle = TMPro.FontStyles.Bold;
+                    label.alignment = TMPro.TextAlignmentOptions.Center;
+                    var lrt = label.GetComponent<RectTransform>();
+                    if (lrt != null) { lrt.anchorMin = Vector2.zero; lrt.anchorMax = Vector2.one; lrt.offsetMin = Vector2.zero; lrt.offsetMax = Vector2.zero; }
+                }
+                backButton.onClick.AddListener(OnBackClicked);
+            }
 
             // Add confirm button inside roomCodePanel
             Button confirmCode = roomCodePanel.GetComponentInChildren<Button>();
@@ -78,6 +101,7 @@ namespace MXMeet.UI
             SetStatus("Enabling passthrough...");
             SetError("");
             SetLoading(false);
+            ApplyEditorPreviewTransparency();
 
             // Auto-enable passthrough when screen opens
             VRMeetUpIntegrationController.Instance?.EnablePassthrough();
@@ -130,6 +154,11 @@ namespace MXMeet.UI
             SceneManager.LoadScene(mainMenuScene);
         }
 
+        private void OnBackClicked()
+        {
+            SceneManager.LoadScene(mainMenuScene);
+        }
+
         // ── Event Handlers ────────────────────────────────────────────────
         private void HandlePassthroughEnabled()
         {
@@ -149,6 +178,7 @@ namespace MXMeet.UI
             SetLoading(false);
             setupPanel.SetActive(false);
             hudPanel.SetActive(true);
+            SetPanelAlpha(hudPanel, 0.12f);
             SetError("");
 
             // Show room info in HUD
@@ -203,6 +233,31 @@ namespace MXMeet.UI
             if (loadingIndicator != null) loadingIndicator.SetActive(loading);
             quickJoinButton.interactable  = !loading && VRMeetUpIntegrationController.Instance?.IsPassthroughActive == true;
             joinByCodeButton.interactable = !loading && VRMeetUpIntegrationController.Instance?.IsPassthroughActive == true;
+        }
+
+        private void ApplyEditorPreviewTransparency()
+        {
+#if UNITY_EDITOR || UNITY_STANDALONE
+            SetPanelAlpha(setupPanel, 0.68f);
+            SetPanelAlpha(hudPanel, 0.72f);
+            SetPanelAlpha(roomCodePanel, 0.78f);
+
+            GameObject background = GameObject.Find("_Background");
+            SetPanelAlpha(background, 0.16f);
+#endif
+        }
+
+        private void SetPanelAlpha(GameObject root, float alpha)
+        {
+            if (root == null) return;
+
+            Image image = root.GetComponent<Image>();
+            if (image != null)
+            {
+                Color color = image.color;
+                color.a = alpha;
+                image.color = color;
+            }
         }
     }
 }

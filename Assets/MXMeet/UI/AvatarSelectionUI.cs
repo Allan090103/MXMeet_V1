@@ -41,28 +41,55 @@ namespace MXMeet.UI
 
         private string _selectedSkin  = "default";
         private string _selectedColor = "#FFFFFF";
+        private AvatarController _avatarController;
 
         private void Start()
         {
-            confirmButton.onClick.AddListener(OnConfirmClicked);
-            skipButton.onClick.AddListener(OnSkipClicked);
+            if (!EnsureAvatarController())
+            {
+                SetError("Avatar system is not ready. Please return to the menu and try again.");
+                SetButtonsInteractable(false);
+                return;
+            }
+
+            if (confirmButton != null)
+            {
+                confirmButton.onClick.RemoveListener(OnConfirmClicked);
+                confirmButton.onClick.AddListener(OnConfirmClicked);
+            }
+
+            if (skipButton != null)
+            {
+                skipButton.onClick.RemoveListener(OnSkipClicked);
+                skipButton.onClick.AddListener(OnSkipClicked);
+            }
 
             // Wire skin buttons
-            foreach (Button btn in skinButtons)
+            if (skinButtons != null)
             {
-                string skinName = btn.name; // button name = skin type
-                btn.onClick.AddListener(() => SelectSkin(skinName, btn.gameObject));
+                foreach (Button btn in skinButtons)
+                {
+                    if (btn == null) continue;
+                    string skinName = btn.name; // button name = skin type
+                    btn.onClick.RemoveAllListeners();
+                    btn.onClick.AddListener(() => SelectSkin(skinName, btn.gameObject));
+                }
             }
 
             // Wire colour swatches
-            foreach (ColorSwatch swatch in colorSwatches)
+            if (colorSwatches != null)
             {
-                ColorSwatch s = swatch; // capture
-                s.button.onClick.AddListener(() => SelectColor(s.hexColor));
+                foreach (ColorSwatch swatch in colorSwatches)
+                {
+                    if (swatch?.button == null) continue;
+                    ColorSwatch s = swatch; // capture
+                    s.button.onClick.RemoveAllListeners();
+                    s.button.onClick.AddListener(() => SelectColor(s.hexColor));
+                }
             }
 
-            AvatarController.Instance.OnAvatarSaved     += HandleAvatarSaved;
-            AvatarController.Instance.OnAvatarSaveFailed += HandleAvatarSaveFailed;
+            _avatarController.OnAvatarSaved     += HandleAvatarSaved;
+            _avatarController.OnAvatarSaveFailed += HandleAvatarSaveFailed;
 
             // Load existing avatar if any
             LoadExistingAvatar();
@@ -71,49 +98,65 @@ namespace MXMeet.UI
 
         private void OnDestroy()
         {
-            if (AvatarController.Instance == null) return;
-            AvatarController.Instance.OnAvatarSaved     -= HandleAvatarSaved;
-            AvatarController.Instance.OnAvatarSaveFailed -= HandleAvatarSaveFailed;
+            if (_avatarController == null) return;
+            _avatarController.OnAvatarSaved     -= HandleAvatarSaved;
+            _avatarController.OnAvatarSaveFailed -= HandleAvatarSaveFailed;
         }
 
         // ── Skin Selection ────────────────────────────────────────────────
         private void SelectSkin(string skinName, GameObject buttonObj)
         {
+            if (!EnsureAvatarController()) return;
+
             _selectedSkin = skinName;
             // Highlight selected button
-            foreach (Button b in skinButtons)
-                b.GetComponent<Image>().color = b.gameObject == buttonObj ? Color.yellow : Color.white;
+            if (skinButtons != null)
+            {
+                foreach (Button b in skinButtons)
+                {
+                    if (b == null) continue;
+                    Image image = b.GetComponent<Image>();
+                    if (image != null) image.color = b.gameObject == buttonObj ? Color.yellow : Color.white;
+                }
+            }
 
             // Update preview
             if (avatarPreviewObject != null)
             {
                 var model = new AvatarModel("preview", skinName, _selectedColor);
-                AvatarController.Instance.ApplyAvatarToGameObject(avatarPreviewObject, model);
+                _avatarController.ApplyAvatarToGameObject(avatarPreviewObject, model);
             }
         }
 
         // ── Colour Selection ──────────────────────────────────────────────
         private void SelectColor(string hexColor)
         {
+            if (!EnsureAvatarController()) return;
+
             _selectedColor = hexColor;
             if (avatarPreviewObject != null)
             {
                 var model = new AvatarModel("preview", _selectedSkin, hexColor);
-                AvatarController.Instance.ApplyAvatarToGameObject(avatarPreviewObject, model);
+                _avatarController.ApplyAvatarToGameObject(avatarPreviewObject, model);
             }
         }
 
         // ── Confirm / Skip ────────────────────────────────────────────────
         private void OnConfirmClicked()
         {
+            if (!EnsureAvatarController()) return;
+
             SetLoading(true);
-            AvatarController.Instance.SaveAvatar(_selectedSkin, _selectedColor);
+            _avatarController.SaveAvatar(_selectedSkin, _selectedColor);
         }
 
         private void OnSkipClicked()
         {
+            if (!EnsureAvatarController()) return;
+
             // Apply default avatar and proceed
-            AvatarController.Instance.SaveAvatar("default", "#FFFFFF");
+            SetLoading(true);
+            _avatarController.SaveAvatar("default", "#FFFFFF");
         }
 
         // ── Event Handlers ────────────────────────────────────────────────
@@ -132,13 +175,15 @@ namespace MXMeet.UI
         // ── Load Existing Avatar ──────────────────────────────────────────
         private async void LoadExistingAvatar()
         {
-            AvatarModel existing = await AvatarController.Instance.LoadAvatar();
+            if (_avatarController == null) return;
+
+            AvatarModel existing = await _avatarController.LoadAvatar();
             if (existing != null)
             {
                 _selectedSkin  = existing.skinType;
                 _selectedColor = existing.colorCode;
                 if (avatarPreviewObject != null)
-                    AvatarController.Instance.ApplyAvatarToGameObject(avatarPreviewObject, existing);
+                    _avatarController.ApplyAvatarToGameObject(avatarPreviewObject, existing);
             }
         }
 
@@ -153,8 +198,44 @@ namespace MXMeet.UI
         private void SetLoading(bool loading)
         {
             if (loadingIndicator != null) loadingIndicator.SetActive(loading);
-            confirmButton.interactable = !loading;
-            skipButton.interactable    = !loading;
+            SetButtonsInteractable(!loading);
+        }
+
+        private void SetButtonsInteractable(bool interactable)
+        {
+            if (confirmButton != null) confirmButton.interactable = interactable;
+            if (skipButton != null) skipButton.interactable = interactable;
+        }
+
+        private bool EnsureAvatarController()
+        {
+            if (_avatarController != null) return true;
+
+            _avatarController = AvatarController.Instance;
+            if (_avatarController == null)
+            {
+                AvatarController existing = FindFirstObjectByType<AvatarController>();
+                if (existing != null)
+                {
+                    _avatarController = existing;
+                }
+            }
+
+            if (_avatarController == null)
+            {
+                GameObject go = new GameObject("AvatarController");
+                _avatarController = go.AddComponent<AvatarController>();
+                DontDestroyOnLoad(go);
+            }
+
+            if (_avatarController == null)
+            {
+                SetError("Avatar system is not ready.");
+                Debug.LogError("[AvatarSelectionUI] Could not create AvatarController.");
+                return false;
+            }
+
+            return true;
         }
     }
 

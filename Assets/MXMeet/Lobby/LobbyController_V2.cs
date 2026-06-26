@@ -6,63 +6,43 @@ using Firebase.Firestore;
 using MXMeet.Auth;
 using MXMeet.Database;
 using MXMeet.Models;
-using Unity.Netcode;
 using UnityEngine;
-using XRMultiplayer; // VRMeetUp namespace
+using XRMultiplayer;
 
 namespace MXMeet.Lobby
 {
     /// <summary>
-    /// Updated Discussion Lobby Controller that uses VRMeetUp's existing
-    /// LobbyManager and XRINetworkGameManager instead of creating its own.
-    ///
-    /// KEY INSIGHT from reading VRMeetUp source:
-    ///   - XRINetworkGameManager.Instance handles ALL lobby/relay/NGO
-    ///   - LobbyManager handles Unity Lobby + Relay transport setup
-    ///   - VoiceChatManager handles ALL Vivox (auto-connects when NGO connects)
-    ///   - XRINetworkPlayer is the networked avatar (already handles name/colour sync)
-    ///
-    /// MXMeet Discussion Lobby ONLY needs to:
-    ///   1. Call XRINetworkGameManager.Instance.CreateNewLobby() for host
-    ///   2. Call XRINetworkGameManager.Instance.JoinLobbyByCode() for guest
-    ///   3. Save lobby records to Firebase Firestore
-    ///   4. Spawn/despawn guest avatar GameObjects in real environment
-    ///   5. Call XRINetworkGameManager.Instance.Disconnect() on leave/end
-    ///
-    /// Vivox voice is handled AUTOMATICALLY by VoiceChatManager when NGO connects.
-    /// No separate voice setup needed.
+    /// MXMeet discussion lobby adapter. VRMeetUp owns networking, Relay, NGO, and Vivox;
+    /// this controller owns MXMeet-specific Firestore records and MR guest markers.
     /// </summary>
     public class LobbyController_V2 : MonoBehaviour
     {
         public static LobbyController_V2 Instance { get; private set; }
 
         [Header("Avatar Spawning")]
-        [Tooltip("Prefab for guest avatar in real environment. Must have XRINetworkPlayer + NetworkObject.")]
         public GameObject guestAvatarPrefab;
+        public Transform spawnAnchor;
 
-        [Tooltip("Where to spawn guest avatars (in front of host). Leave null to auto-calculate.")]
-        public Transform  spawnAnchor;
+        public event Action<DiscussionLobbyModel> OnLobbyCreated;
+        public event Action OnLobbyJoined;
+        public event Action OnLobbyEnded;
+        public event Action<string> OnError;
+        public event Action<string> OnStatusUpdate;
+        public event Action<string, GameObject> OnGuestAvatarSpawned;
+        public event Action<string> OnGuestLeft;
 
-        // Events
-        public event Action<DiscussionLobbyModel>    OnLobbyCreated;
-        public event Action                          OnLobbyJoined;
-        public event Action                          OnLobbyEnded;
-        public event Action<string>                  OnError;
-        public event Action<string>                  OnStatusUpdate;
-        public event Action<string, GameObject>      OnGuestAvatarSpawned;
-        public event Action<string>                  OnGuestLeft;
-
-        // State
         public DiscussionLobbyModel CurrentLobby { get; private set; }
-        public bool                 IsHost        { get; private set; }
-        public string               LobbyCode     => XRINetworkGameManager.ConnectedRoomCode;
-        public string               UnityLobbyCode => LobbyCode;
-        public string               LobbyName     => XRINetworkGameManager.ConnectedRoomName.Value;
+        public bool IsHost { get; private set; }
+        public string LobbyCode => XRINetworkGameManager.ConnectedRoomCode;
+        public string UnityLobbyCode => LobbyCode;
+        public string LobbyName => XRINetworkGameManager.ConnectedRoomName.Value;
 
         private FirebaseFirestore _db;
-        private string            _memberID;
-        private string            _logID;
-        private string            _joinTimeISO;
+        private string _memberId;
+        private string _joinTimeIso;
+        private bool _hostRecordsSaved;
+        private bool _joinRecordsSaved;
+        private XRINetworkGameManager _hookedNetworkManager;
 
         private readonly Dictionary<ulong, GameObject> _spawnedAvatars = new();
 
@@ -75,257 +55,365 @@ namespace MXMeet.Lobby
 
         private void Start()
         {
-            // Firebase
-            if (FirebaseManager.Instance.IsReady) _db = FirebaseManager.Instance.DB;
-            else FirebaseManager.Instance.OnFirebaseReady += () => _db = FirebaseManager.Instance.DB;
+            if (FirebaseManager.Instance != null && FirebaseManager.Instance.IsReady)
+                _db = FirebaseManager.Instance.DB;
+            else if (FirebaseManager.Instance != null)
+                FirebaseManager.Instance.OnFirebaseReady += OnFirebaseReady;
 
-            // Subscribe to VRMeetUp connection events
             XRINetworkGameManager.Connected.Subscribe(OnNGOConnectionChanged);
-            if (XRINetworkGameManager.Instance != null)
-            {
-                XRINetworkGameManager.Instance.playerStateChanged     += OnPlayerStateChanged;
-                XRINetworkGameManager.Instance.connectionFailedAction += OnConnectionFailed;
-            }
-            else
-            {
-                Debug.LogWarning("[LobbyController_V2] XRINetworkGameManager not ready at Start — will hook on first connection.");
-            }
+            HookNetworkEvents();
+        }
+
+        private void Update()
+        {
+            if (_hookedNetworkManager == null)
+                HookNetworkEvents();
         }
 
         private void OnDestroy()
         {
+            if (FirebaseManager.Instance != null)
+                FirebaseManager.Instance.OnFirebaseReady -= OnFirebaseReady;
+
             XRINetworkGameManager.Connected.Unsubscribe(OnNGOConnectionChanged);
-            if (XRINetworkGameManager.Instance != null)
-            {
-                XRINetworkGameManager.Instance.playerStateChanged    -= OnPlayerStateChanged;
-                XRINetworkGameManager.Instance.connectionFailedAction -= OnConnectionFailed;
-            }
+            UnhookNetworkEvents();
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // UC06: Create Discussion Lobby (Host)
-        // ═══════════════════════════════════════════════════════════════
-        /// <summary>
-        /// Creates a Discussion Lobby using VRMeetUp's XRINetworkGameManager.
-        /// This handles Lobby + Relay + NGO host automatically.
-        /// </summary>
+        private void OnFirebaseReady()
+        {
+            _db = FirebaseManager.Instance.DB;
+        }
+
+        private void HookNetworkEvents()
+        {
+            XRINetworkGameManager manager = XRINetworkGameManager.Instance;
+            if (manager == null)
+            {
+                Debug.LogWarning("[LobbyController_V2] XRINetworkGameManager not ready yet.");
+                return;
+            }
+
+            if (_hookedNetworkManager == manager) return;
+
+            UnhookNetworkEvents();
+            manager.playerStateChanged += OnPlayerStateChanged;
+            manager.connectionFailedAction += OnConnectionFailed;
+            _hookedNetworkManager = manager;
+        }
+
+        private void UnhookNetworkEvents()
+        {
+            if (_hookedNetworkManager == null) return;
+            _hookedNetworkManager.playerStateChanged -= OnPlayerStateChanged;
+            _hookedNetworkManager.connectionFailedAction -= OnConnectionFailed;
+            _hookedNetworkManager = null;
+        }
+
         public async void CreateLobby()
         {
-            string userID   = AuthController.Instance.CurrentUser?.userID;
-            string username = AuthController.Instance.CurrentUser?.username ?? "Host";
-            if (string.IsNullOrEmpty(userID)) { OnError?.Invoke("Not logged in."); return; }
+            if (!TryGetUser(out string userId, out string username)) return;
+            if (!EnsureFirebaseReady()) return;
+            XRINetworkGameManager manager = ResolveNetworkManager();
+            if (manager == null) { OnError?.Invoke("VRMeetUp network manager is not ready."); return; }
+            if (!await EnsureVRMeetUpAuthenticated(manager)) return;
 
             try
             {
-                // Set player identity in VRMeetUp
-                XRINetworkGameManager.LocalPlayerName.Value = username;
-
-                OnStatusUpdate?.Invoke("Creating lobby...");
-
-                // Create lobby via VRMeetUp's system (handles Relay + NGO host)
-                XRINetworkGameManager.Instance.CreateNewLobby(
-                    roomName:    $"{username}'s Lobby",
-                    isPrivate:   false,
-                    playerCount: XRINetworkGameManager.maxPlayers
-                );
-
-                // Save to Firestore (done optimistically; update with room code after NGO connects)
-                CurrentLobby = new DiscussionLobbyModel(userID);
-                await _db.Collection("discussionLobbies")
-                         .Document(CurrentLobby.lobbyID)
-                         .SetAsync(CurrentLobby.ToDictionary());
-
+                string lobbyName = $"{username}'s Lobby";
+                CurrentLobby = new DiscussionLobbyModel(userId, lobbyName);
                 IsHost = true;
-                // OnLobbyCreated is fired in OnNGOConnectionChanged when connected == true
+                _hostRecordsSaved = false;
+                _joinRecordsSaved = false;
 
-                Debug.Log("[LobbyController_V2] CreateNewLobby called.");
+                await _db.Collection("discussion_lobbies")
+                    .Document(CurrentLobby.lobbyId)
+                    .SetAsync(CurrentLobby.ToDictionary());
+
+                XRINetworkGameManager.LocalPlayerName.Value = username;
+                OnStatusUpdate?.Invoke("Creating lobby...");
+                manager.CreateNewLobby(lobbyName, false, XRINetworkGameManager.maxPlayers);
             }
             catch (Exception e)
             {
-                Debug.LogError($"[LobbyController_V2] CreateLobby error: {e.Message}");
+                Debug.LogError($"[LobbyController_V2] CreateLobby error: {e}");
                 OnError?.Invoke("Failed to create lobby.");
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // UC07: Join Discussion Lobby (Guest)
-        // ═══════════════════════════════════════════════════════════════
-        /// <summary>
-        /// Joins an existing Discussion Lobby by VRMeetUp room code.
-        /// VRMeetUp's JoinLobbyByCode handles Relay + NGO client automatically.
-        /// </summary>
-        public void JoinLobby(string roomCode)
+        public async void JoinLobby(string roomCode)
         {
-            string userID   = AuthController.Instance.CurrentUser?.userID;
-            string username = AuthController.Instance.CurrentUser?.username ?? "Guest";
-            if (string.IsNullOrEmpty(userID)) { OnError?.Invoke("Not logged in."); return; }
+            if (!TryGetUser(out string userId, out string username)) return;
+            if (!EnsureFirebaseReady()) return;
+            XRINetworkGameManager manager = ResolveNetworkManager();
+            if (manager == null) { OnError?.Invoke("VRMeetUp network manager is not ready."); return; }
+            if (!await EnsureVRMeetUpAuthenticated(manager)) return;
+
+            roomCode = (roomCode ?? string.Empty).Trim().ToUpperInvariant();
+            if (string.IsNullOrEmpty(roomCode)) { OnError?.Invoke("Please enter a lobby code."); return; }
 
             try
             {
-                // Set player identity in VRMeetUp
-                XRINetworkGameManager.LocalPlayerName.Value = username;
-
-                OnStatusUpdate?.Invoke($"Joining lobby {roomCode}...");
-
-                // Join via VRMeetUp's system
-                XRINetworkGameManager.Instance.JoinLobbyByCode(roomCode);
+                OnStatusUpdate?.Invoke($"Checking lobby {roomCode}...");
+                CurrentLobby = await FindLobbyByRoomCode(roomCode);
+                if (CurrentLobby == null)
+                {
+                    OnError?.Invoke("Lobby not found or already ended.");
+                    return;
+                }
 
                 IsHost = false;
-                // Firebase records saved in OnNGOConnectionChanged after connected
+                _memberId = null;
+                _joinTimeIso = null;
+                _joinRecordsSaved = false;
 
-                Debug.Log($"[LobbyController_V2] JoinLobbyByCode({roomCode}) called.");
+                XRINetworkGameManager.LocalPlayerName.Value = username;
+                OnStatusUpdate?.Invoke($"Joining lobby {roomCode}...");
+                manager.JoinLobbyByCode(roomCode);
             }
             catch (Exception e)
             {
-                Debug.LogError($"[LobbyController_V2] JoinLobby error: {e.Message}");
+                Debug.LogError($"[LobbyController_V2] JoinLobby error: {e}");
                 OnError?.Invoke("Failed to join lobby.");
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // UC08: Leave Discussion Lobby (Guest)
-        // ═══════════════════════════════════════════════════════════════
         public async void LeaveLobby()
         {
             try
             {
                 await SaveLeaveRecords();
-                XRINetworkGameManager.Instance.Disconnect();
-                CleanupLobby();
-                OnLobbyEnded?.Invoke();
-                Debug.Log("[LobbyController_V2] Left lobby.");
+                XRINetworkGameManager.Instance?.Disconnect();
             }
             catch (Exception e)
             {
-                Debug.LogError($"[LobbyController_V2] LeaveLobby error: {e.Message}");
+                Debug.LogError($"[LobbyController_V2] LeaveLobby error: {e}");
+            }
+            finally
+            {
+                CleanupSpawnedAvatars();
                 CleanupLobby();
                 OnLobbyEnded?.Invoke();
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // End Lobby (Host)
-        // ═══════════════════════════════════════════════════════════════
         public async void EndLobby()
         {
             try
             {
-                // Update Firestore lobby status
-                if (CurrentLobby != null)
+                if (CurrentLobby != null && EnsureFirebaseReady())
                 {
-                    await _db.Collection("discussionLobbies")
-                             .Document(CurrentLobby.lobbyID)
-                             .UpdateAsync(new Dictionary<string, object>
-                             {
-                                 { "status",  "ended"                            },
-                                 { "endedAt", DateTime.UtcNow.ToString("o")  }
-                             });
+                    string endedAt = DateTime.UtcNow.ToString("o");
+                    await _db.Collection("discussion_lobbies")
+                        .Document(CurrentLobby.lobbyId)
+                        .UpdateAsync(new Dictionary<string, object>
+                        {
+                            { "status", "ended" },
+                            { "endedAt", endedAt }
+                        });
+
+                    await EndActiveMembers(endedAt);
+                    await AddMeetupLog(CurrentLobby.lobbyId, CurrentUserId(), "Lobby Ended", CurrentDurationSeconds());
                 }
 
-                // Despawn all guest avatars
-                foreach (var kv in _spawnedAvatars)
-                    if (kv.Value != null) Destroy(kv.Value);
-                _spawnedAvatars.Clear();
-
-                // Disconnect via VRMeetUp (this also deletes the Unity Lobby)
-                XRINetworkGameManager.Instance.Disconnect();
-
-                CleanupLobby();
-                OnLobbyEnded?.Invoke();
-                Debug.Log("[LobbyController_V2] Lobby ended.");
+                XRINetworkGameManager.Instance?.Disconnect();
             }
             catch (Exception e)
             {
-                Debug.LogError($"[LobbyController_V2] EndLobby error: {e.Message}");
+                Debug.LogError($"[LobbyController_V2] EndLobby error: {e}");
+            }
+            finally
+            {
+                CleanupSpawnedAvatars();
                 CleanupLobby();
                 OnLobbyEnded?.Invoke();
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // VRMeetUp Connection Callback
-        // ═══════════════════════════════════════════════════════════════
+        public void SetSelfMuted(bool muted)
+        {
+            var voice = FindFirstObjectByType<VoiceChatManager>();
+            if (voice == null)
+            {
+                OnError?.Invoke("Voice chat manager is not available.");
+                return;
+            }
+
+            voice.ToggleSelfMute(true, muted);
+        }
+
         private async void OnNGOConnectionChanged(bool connected)
         {
-            if (connected)
+            if (!connected)
             {
-                // Update Firestore lobby with actual Unity room code
-                if (CurrentLobby != null && IsHost)
-                {
-                    await _db.Collection("discussionLobbies")
-                             .Document(CurrentLobby.lobbyID)
-                             .UpdateAsync(new Dictionary<string, object>
-                             {
-                                 { "unityRoomCode", XRINetworkGameManager.ConnectedRoomCode }
-                             });
-                }
+                Debug.Log("[LobbyController_V2] NGO disconnected.");
+                return;
+            }
 
-                // For guests: find and save lobby member records
-                if (!IsHost)
+            if (!EnsureFirebaseReady()) return;
+
+            try
+            {
+                if (IsHost)
+                {
+                    await SaveHostConnectionRecords();
+                    OnLobbyCreated?.Invoke(CurrentLobby);
+                }
+                else
                 {
                     await SaveJoinRecords();
                     OnLobbyJoined?.Invoke();
                 }
-                else
-                {
-                    OnLobbyCreated?.Invoke(CurrentLobby);
-                }
 
                 OnStatusUpdate?.Invoke($"Connected to {XRINetworkGameManager.ConnectedRoomName.Value}");
             }
-            else
+            catch (Exception e)
             {
-                // Cleaned up by Leave/End, or external disconnect
-                Debug.Log("[LobbyController_V2] NGO disconnected.");
+                Debug.LogError($"[LobbyController_V2] Connection record error: {e}");
+                OnError?.Invoke("Connected, but failed to save lobby records.");
             }
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // Player Join/Leave (NGO callbacks from XRINetworkGameManager)
-        // ═══════════════════════════════════════════════════════════════
-        private void OnPlayerStateChanged(ulong clientID, bool joined)
+        private async Task SaveHostConnectionRecords()
+        {
+            if (CurrentLobby == null || _hostRecordsSaved) return;
+
+            string roomCode = XRINetworkGameManager.ConnectedRoomCode;
+            CurrentLobby.roomCode = roomCode;
+            CurrentLobby.status = "active";
+
+            await _db.Collection("discussion_lobbies")
+                .Document(CurrentLobby.lobbyId)
+                .UpdateAsync(new Dictionary<string, object>
+                {
+                    { "roomCode", roomCode },
+                    { "status", "active" }
+                });
+
+            await AddMember(CurrentLobby.lobbyId, CurrentUserId(), CurrentUsername("Host"), "host");
+            await AddMeetupLog(CurrentLobby.lobbyId, CurrentUserId(), "Lobby Created");
+            _hostRecordsSaved = true;
+        }
+
+        private async Task SaveJoinRecords()
+        {
+            if (_joinRecordsSaved) return;
+
+            if (CurrentLobby == null)
+                CurrentLobby = await FindLobbyByRoomCode(XRINetworkGameManager.ConnectedRoomCode);
+
+            if (CurrentLobby == null)
+                throw new InvalidOperationException("MXMeet lobby record was not found for the connected room.");
+
+            await AddMember(CurrentLobby.lobbyId, CurrentUserId(), CurrentUsername("Guest"), "guest");
+            await AddMeetupLog(CurrentLobby.lobbyId, CurrentUserId(), "User Joined");
+            _joinRecordsSaved = true;
+        }
+
+        private async Task SaveLeaveRecords()
+        {
+            if (CurrentLobby == null || !EnsureFirebaseReady()) return;
+
+            string leftAt = DateTime.UtcNow.ToString("o");
+            int duration = CurrentDurationSeconds();
+
+            if (!string.IsNullOrEmpty(_memberId))
+            {
+                await _db.Collection("lobby_members")
+                    .Document(_memberId)
+                    .UpdateAsync(new Dictionary<string, object>
+                    {
+                        { "leftAt", leftAt },
+                        { "status", "left" }
+                    });
+            }
+
+            await AddMeetupLog(CurrentLobby.lobbyId, CurrentUserId(), "User Left", duration);
+        }
+
+        private async Task AddMember(string lobbyId, string userId, string username, string role)
+        {
+            var member = new LobbyMemberModel(lobbyId, userId, username, role);
+            _memberId = member.memberId;
+            _joinTimeIso = member.joinedAt;
+
+            await _db.Collection("lobby_members")
+                .Document(member.memberId)
+                .SetAsync(member.ToDictionary());
+        }
+
+        private async Task AddMeetupLog(string lobbyId, string userId, string action, int duration = 0)
+        {
+            var log = new MeetupLogModel(lobbyId, userId, action, duration);
+            await _db.Collection("meetup_logs")
+                .Document(log.logId)
+                .SetAsync(log.ToDictionary());
+        }
+
+        private async Task EndActiveMembers(string leftAt)
+        {
+            if (CurrentLobby == null) return;
+
+            QuerySnapshot members = await _db.Collection("lobby_members")
+                .WhereEqualTo("lobbyId", CurrentLobby.lobbyId)
+                .WhereEqualTo("status", "active")
+                .GetSnapshotAsync();
+
+            foreach (DocumentSnapshot doc in members.Documents)
+            {
+                await doc.Reference.UpdateAsync(new Dictionary<string, object>
+                {
+                    { "leftAt", leftAt },
+                    { "status", "left" }
+                });
+            }
+        }
+
+        private async Task<DiscussionLobbyModel> FindLobbyByRoomCode(string roomCode)
+        {
+            QuerySnapshot snap = await _db.Collection("discussion_lobbies")
+                .WhereEqualTo("roomCode", roomCode)
+                .GetSnapshotAsync();
+
+            foreach (DocumentSnapshot doc in snap.Documents)
+            {
+                var lobby = doc.ConvertTo<DiscussionLobbyModel>();
+                if (lobby.status == "waiting" || lobby.status == "active")
+                    return lobby;
+            }
+
+            return null;
+        }
+
+        private void OnPlayerStateChanged(ulong clientId, bool joined)
         {
             if (joined)
             {
-                // Spawn avatar in real environment for non-local players
-                if (clientID != XRINetworkGameManager.LocalId)
-                    SpawnGuestAvatar(clientID);
+                if (clientId != XRINetworkGameManager.LocalId)
+                    SpawnGuestAvatar(clientId);
+                return;
             }
-            else
+
+            if (_spawnedAvatars.TryGetValue(clientId, out GameObject avatar))
             {
-                // Remove avatar
-                if (_spawnedAvatars.TryGetValue(clientID, out GameObject av))
-                {
-                    string username = "Guest";
-                    if (XRINetworkGameManager.Instance.GetPlayerByID(clientID, out XRINetworkPlayer player))
-                    {
-                        username = player.playerName;
-                    }
-                    Destroy(av);
-                    _spawnedAvatars.Remove(clientID);
-                    Debug.Log($"[LobbyController_V2] Removed avatar for client {clientID}");
-                    OnGuestLeft?.Invoke(username);
-                }
+                string username = "Guest";
+                if (XRINetworkGameManager.Instance.GetPlayerByID(clientId, out XRINetworkPlayer player))
+                    username = player.playerName;
+
+                Destroy(avatar);
+                _spawnedAvatars.Remove(clientId);
+                OnGuestLeft?.Invoke(username);
             }
         }
 
-        private void OnConnectionFailed(string reason)
+        private void SpawnGuestAvatar(ulong clientId)
         {
-            OnError?.Invoke($"Connection failed: {reason}");
-        }
+            if (guestAvatarPrefab == null || _spawnedAvatars.ContainsKey(clientId)) return;
 
-        // ═══════════════════════════════════════════════════════════════
-        // Avatar Spawning
-        // ═══════════════════════════════════════════════════════════════
-        private void SpawnGuestAvatar(ulong clientID)
-        {
-            if (guestAvatarPrefab == null) return;
-            if (_spawnedAvatars.ContainsKey(clientID)) return;
-
-            // Calculate spawn position
             Vector3 spawnPos;
             if (spawnAnchor != null)
+            {
                 spawnPos = spawnAnchor.position;
+            }
             else
             {
                 Transform cam = Camera.main?.transform;
@@ -335,77 +423,110 @@ namespace MXMeet.Lobby
             }
 
             GameObject avatarObj = Instantiate(guestAvatarPrefab, spawnPos, Quaternion.identity);
-            _spawnedAvatars[clientID] = avatarObj;
+            _spawnedAvatars[clientId] = avatarObj;
 
             string playerName = "Guest";
-            // Try get player name from XRINetworkPlayer and apply to avatar label
-            if (XRINetworkGameManager.Instance.GetPlayerByID(clientID, out XRINetworkPlayer player))
+            if (XRINetworkGameManager.Instance.GetPlayerByID(clientId, out XRINetworkPlayer player))
             {
                 playerName = player.playerName;
                 var label = avatarObj.GetComponentInChildren<TMPro.TextMeshProUGUI>();
                 if (label != null) label.text = playerName;
             }
 
-            Debug.Log($"[LobbyController_V2] Spawned avatar for client {clientID}");
             OnGuestAvatarSpawned?.Invoke(playerName, avatarObj);
         }
 
-        // ═══════════════════════════════════════════════════════════════
-        // Firebase Record Helpers
-        // ═══════════════════════════════════════════════════════════════
-        private async Task SaveJoinRecords()
+        private void OnConnectionFailed(string reason)
         {
-            string userID  = AuthController.Instance.CurrentUser?.userID;
-            string username = AuthController.Instance.CurrentUser?.username ?? "Guest";
-            _joinTimeISO   = DateTime.UtcNow.ToString("o");
-
-            // Find the Firestore lobby matching the Unity room code
-            QuerySnapshot snap = await _db.Collection("discussionLobbies")
-                                          .WhereEqualTo("unityRoomCode", XRINetworkGameManager.ConnectedRoomCode)
-                                          .WhereEqualTo("status", "active")
-                                          .GetSnapshotAsync();
-
-            var docsList = snap.Documents.ToList();
-            string firestoreLobbyID = docsList.Count > 0 ? docsList[0].Id : "unknown";
-            CurrentLobby = docsList.Count > 0 ? docsList[0].ConvertTo<DiscussionLobbyModel>() : null;
-
-            // Save LOBBY_MEMBER
-            var member = new LobbyMemberModel(firestoreLobbyID, userID, username);
-            _memberID = member.memberID;
-            await _db.Collection("lobbyMembers").Document(_memberID).SetAsync(member.ToDictionary());
-
-            // Save MEETUP_LOG
-            var log = new MeetupLogModel(firestoreLobbyID, userID, _joinTimeISO);
-            _logID = log.logID;
-            await _db.Collection("meetupLogs").Document(_logID).SetAsync(log.ToDictionary());
+            OnError?.Invoke($"Connection failed: {reason}");
         }
 
-        private async Task SaveLeaveRecords()
+        private bool TryGetUser(out string userId, out string username)
         {
-            string leaveTime = DateTime.UtcNow.ToString("o");
-            int    duration  = string.IsNullOrEmpty(_joinTimeISO) ? 0
-                : (int)(DateTime.Parse(leaveTime) - DateTime.Parse(_joinTimeISO)).TotalSeconds;
+            userId = CurrentUserId();
+            username = CurrentUsername("Guest");
+            if (!string.IsNullOrEmpty(userId)) return true;
 
-            if (!string.IsNullOrEmpty(_memberID))
-                await _db.Collection("lobbyMembers").Document(_memberID)
-                         .UpdateAsync(new Dictionary<string, object> { { "leaveTime", leaveTime } });
+            OnError?.Invoke("Not logged in.");
+            return false;
+        }
 
-            if (!string.IsNullOrEmpty(_logID))
-                await _db.Collection("meetupLogs").Document(_logID)
-                         .UpdateAsync(new Dictionary<string, object>
-                         {
-                             { "leaveTime", leaveTime },
-                             { "duration",  duration  }
-                         });
+        private bool EnsureFirebaseReady()
+        {
+            if (_db != null) return true;
+
+            if (FirebaseManager.Instance != null && FirebaseManager.Instance.IsReady)
+            {
+                _db = FirebaseManager.Instance.DB;
+                return true;
+            }
+
+            OnError?.Invoke("Firebase is not ready.");
+            return false;
+        }
+
+        private string CurrentUserId() => AuthController.Instance?.CurrentUser?.userId;
+
+        private string CurrentUsername(string fallback) =>
+            AuthController.Instance?.CurrentUser?.username ?? fallback;
+
+        private int CurrentDurationSeconds()
+        {
+            if (string.IsNullOrEmpty(_joinTimeIso)) return 0;
+            return (int)(DateTime.UtcNow - DateTime.Parse(_joinTimeIso)).TotalSeconds;
+        }
+
+        private void CleanupSpawnedAvatars()
+        {
+            foreach (var avatar in _spawnedAvatars.Values.Where(avatar => avatar != null))
+                Destroy(avatar);
+
+            _spawnedAvatars.Clear();
         }
 
         private void CleanupLobby()
         {
             CurrentLobby = null;
-            IsHost       = false;
-            _memberID    = null;
-            _logID       = null;
-            _joinTimeISO = null;
+            IsHost = false;
+            _memberId = null;
+            _joinTimeIso = null;
+            _hostRecordsSaved = false;
+            _joinRecordsSaved = false;
+        }
+
+        private XRINetworkGameManager ResolveNetworkManager()
+        {
+            HookNetworkEvents();
+            if (_hookedNetworkManager != null) return _hookedNetworkManager;
+
+#if UNITY_EDITOR
+            MXMeet.EditorBootstrap.EnsureVRMeetUpManagersForEditorTesting();
+            HookNetworkEvents();
+#endif
+
+            return _hookedNetworkManager ?? XRINetworkGameManager.Instance;
+        }
+
+        private async Task<bool> EnsureVRMeetUpAuthenticated(XRINetworkGameManager manager)
+        {
+            if (manager == null) return false;
+            if (manager.IsAuthenticated()) return true;
+
+            try
+            {
+                OnStatusUpdate?.Invoke("Authenticating VRMeetUp services...");
+                bool authenticated = await manager.Authenticate();
+                if (authenticated) return true;
+
+                OnError?.Invoke("VRMeetUp authentication failed. Check Unity Gaming Services settings.");
+                return false;
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[LobbyController_V2] VRMeetUp auth error: {e}");
+                OnError?.Invoke($"VRMeetUp authentication failed: {e.Message}");
+                return false;
+            }
         }
     }
 }

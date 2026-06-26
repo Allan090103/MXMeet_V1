@@ -104,12 +104,19 @@ namespace MXMeet.Auth
 
         private void Start()
         {
+            if (FirebaseManager.Instance == null)
+            {
+                OnLoginFailed?.Invoke("Firebase manager is not loaded.");
+                return;
+            }
+
             if (FirebaseManager.Instance.IsReady) Initialise();
             else FirebaseManager.Instance.OnFirebaseReady += Initialise;
         }
 
         private void Initialise()
         {
+            if (FirebaseManager.Instance == null) return;
             _auth = FirebaseManager.Instance.Auth;
             _db   = FirebaseManager.Instance.DB;
         }
@@ -119,13 +126,14 @@ namespace MXMeet.Auth
             if (_auth == null) { OnRegisterFailed?.Invoke("Firebase not ready."); return; }
             try
             {
+                if (_db == null) { OnRegisterFailed?.Invoke("Firestore is not ready."); return; }
                 bool taken = await IsUsernameTaken(username);
                 if (taken) { OnRegisterFailed?.Invoke("Username already taken."); return; }
 
                 AuthResult result  = await _auth.CreateUserWithEmailAndPasswordAsync(email, password);
                 FirebaseUser fbUser = result.User;
 
-                var user   = new UserModel(fbUser.UserId, username);
+                var user   = new UserModel(fbUser.UserId, username, email);
                 var avatar = new AvatarModel(fbUser.UserId, "default", "#FFFFFF");
 
                 await _db.Collection("users").Document(fbUser.UserId).SetAsync(user.ToDictionary());
@@ -146,6 +154,7 @@ namespace MXMeet.Auth
             if (_auth == null) { OnLoginFailed?.Invoke("Firebase not ready."); return; }
             try
             {
+                if (_db == null) { OnLoginFailed?.Invoke("Firestore is not ready."); return; }
                 AuthResult result  = await _auth.SignInWithEmailAndPasswordAsync(email, password);
                 FirebaseUser fbUser = result.User;
 
@@ -179,7 +188,9 @@ namespace MXMeet.Auth
             CurrentUser = user;
             try
             {
-                DocumentSnapshot doc = await _db.Collection("avatars").Document(user.userID).GetSnapshotAsync();
+                if (_db == null) Initialise();
+                if (_db == null) return;
+                DocumentSnapshot doc = await _db.Collection("avatars").Document(user.userId).GetSnapshotAsync();
                 if (doc.Exists) CurrentAvatar = doc.ConvertTo<AvatarModel>();
             }
             catch (Exception e) { Debug.LogWarning($"[AuthController] Avatar restore failed: {e.Message}"); }
@@ -211,8 +222,9 @@ namespace MXMeet.Models
     {
         public Dictionary<string, object> ToDictionary() => new Dictionary<string, object>
         {
-            { "userID",    userID    },
+            { "userId",    userId    },
             { "username",  username  },
+            { "email",     email     },
             { "createdAt", createdAt },
         };
     }

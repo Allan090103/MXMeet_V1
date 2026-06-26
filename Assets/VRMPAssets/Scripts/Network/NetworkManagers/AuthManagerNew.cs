@@ -58,25 +58,24 @@ namespace CustomNetwork
         // Start is called before the first frame update
         async void Start()
         {
-            try 
+            try
             {
                 await UnityServices.InitializeAsync();
+
+                if (!AuthenticationService.Instance.IsSignedIn)
+                    await AuthenticationService.Instance.SignInAnonymouslyAsync();
+
+                XRINetworkGameManager.AuthenicationId = AuthenticationService.Instance.PlayerId;
+                Utils.Log($"{k_DebugPrepend}Unity Services Initialized");
             }
             catch (Exception ex)
             {
                 Utils.Log($"{k_DebugPrepend}UnityServices init failed: {ex.Message}");
             }
 
-            // BYPASS LOGIN: Automatically sign the user in as Guest
             IsUserSignedIn = true;
-            XRINetworkGameManager.LocalPlayerName.Value = "GuestUser";
-            XRINetworkGameManager.AuthenicationId = "Guest-12345";
-
-            // Hide sign-in screen, show lobby
             signInDisplay.SetActive(false);
             lobbyDisplay.SetActive(true);
-            
-            // Invoke success events so any listening scripts update
             OnSignInSuccess?.Invoke();
         }
 
@@ -291,12 +290,22 @@ namespace CustomNetwork
         public virtual async Task<bool> Authenticate()
         {
             await InitializeUnityServices();
-            bool isUserSignedIn = IsAuthenticated();
-            if (isUserSignedIn)
+
+            if (!AuthenticationService.Instance.IsSignedIn)
             {
-                XRINetworkGameManager.AuthenicationId = AuthenticationService.Instance.PlayerId;
+                try
+                {
+                    await AuthenticationService.Instance.SignInAnonymouslyAsync();
+                }
+                catch (Exception e)
+                {
+                    Utils.Log($"{k_DebugPrepend}Anonymous sign-in failed: {e.Message}");
+                    return false;
+                }
             }
-            return UnityServices.State == ServicesInitializationState.Initialized;
+
+            XRINetworkGameManager.AuthenicationId = AuthenticationService.Instance.PlayerId;
+            return AuthenticationService.Instance.IsSignedIn;
         }
 
         public static bool IsAuthenticated()

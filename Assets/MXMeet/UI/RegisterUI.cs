@@ -1,8 +1,4 @@
-using System;
-using System.Threading.Tasks;
-using Firebase.Auth;
-using Firebase.Firestore;
-using MXMeet.Database;
+using MXMeet.Auth;
 using MXMeet.Models;
 using UnityEngine;
 using UnityEngine.UI;
@@ -10,10 +6,8 @@ using UnityEngine.UI;
 namespace MXMeet.UI
 {
     /// <summary>
-    /// UI controller for user registration (UC01).
-    /// Attach this script to a Canvas GameObject that contains the input fields
-    /// and a Register button. The UI is designed with smooth fade‑in animation
-    /// and modern styling (Inter font, glass‑morphism background).
+    /// Legacy standalone registration UI. Kept for scenes that still reference it,
+    /// but registration is delegated to AuthController so UI does not call Firebase directly.
     /// </summary>
     public class RegisterUI : MonoBehaviour
     {
@@ -22,26 +16,30 @@ namespace MXMeet.UI
         public InputField passwordInput;
         public InputField displayNameInput;
         public Button registerButton;
-        public Text feedbackText; // optional status messages
+        public Text feedbackText;
 
         private void Awake()
         {
-            // Defensive checks – log missing references in the console.
             if (emailInput == null || passwordInput == null || displayNameInput == null || registerButton == null)
             {
                 Debug.LogError("[RegisterUI] One or more UI references are not assigned.");
                 enabled = false;
                 return;
             }
-            // Bind button click
+
             registerButton.onClick.AddListener(OnRegisterClicked);
+        }
+
+        private void OnDestroy()
+        {
+            Unsubscribe();
         }
 
         private void OnRegisterClicked()
         {
-            var email = emailInput.text.Trim();
-            var password = passwordInput.text;
-            var displayName = displayNameInput.text.Trim();
+            string email = emailInput.text.Trim();
+            string password = passwordInput.text;
+            string displayName = displayNameInput.text.Trim();
 
             if (string.IsNullOrEmpty(email) || string.IsNullOrEmpty(password) || string.IsNullOrEmpty(displayName))
             {
@@ -49,53 +47,46 @@ namespace MXMeet.UI
                 return;
             }
 
-            // Disable UI while registering
+            if (password.Length < 6)
+            {
+                ShowFeedback("Password must be at least 6 characters.");
+                return;
+            }
+
+            if (AuthController.Instance == null)
+            {
+                ShowFeedback("Authentication is not ready.");
+                return;
+            }
+
             SetInteraction(false);
-            ShowFeedback("Registering…");
-            RegisterUserAsync(email, password, displayName);
+            ShowFeedback("Registering...");
+            Unsubscribe();
+            AuthController.Instance.OnRegisterSuccess += HandleRegisterSuccess;
+            AuthController.Instance.OnRegisterFailed += HandleRegisterFailed;
+            AuthController.Instance.Register(displayName, email, password);
         }
 
-        private async void RegisterUserAsync(string email, string password, string displayName)
+        private void HandleRegisterSuccess(UserModel user)
         {
-            try
-            {
-                // Ensure Firebase is ready
-                await WaitForFirebaseReady();
-
-                // Create Auth account
-                var authResult = await FirebaseManager.Instance.Auth
-                    .CreateUserWithEmailAndPasswordAsync(email, password);
-                FirebaseUser fbUser = authResult.User;
-
-                // After account creation, write profile and avatar to Firestore
-                var user   = new UserModel(fbUser.UserId, displayName);
-                var avatar = new AvatarModel(fbUser.UserId, "default", "#FFFFFF");
-                await FirebaseManager.Instance.DB.Collection("users").Document(fbUser.UserId).SetAsync(user.ToDictionary());
-                await FirebaseManager.Instance.DB.Collection("avatars").Document(fbUser.UserId).SetAsync(avatar.ToDictionary());
-
-                ShowFeedback("Registration successful! You can now log in.");
-                // Optionally auto‑login or transition to the next UI screen here.
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[RegisterUI] Registration failed: {ex.Message}");
-                ShowFeedback($"Error: {ex.Message}");
-            }
-            finally
-            {
-                SetInteraction(true);
-            }
+            Unsubscribe();
+            ShowFeedback("Registration successful! You can now log in.");
+            SetInteraction(true);
         }
 
-        private async Task WaitForFirebaseReady()
+        private void HandleRegisterFailed(string error)
         {
-            // If Firebase isn’t ready yet, wait until the manager fires the event.
-            if (FirebaseManager.Instance.IsReady) return;
-            var tcs = new TaskCompletionSource<bool>();
-            void OnReady() { tcs.TrySetResult(true); }
-            FirebaseManager.Instance.OnFirebaseReady += OnReady;
-            await tcs.Task;
-            FirebaseManager.Instance.OnFirebaseReady -= OnReady;
+            Unsubscribe();
+            Debug.LogError($"[RegisterUI] Registration failed: {error}");
+            ShowFeedback($"Error: {error}");
+            SetInteraction(true);
+        }
+
+        private void Unsubscribe()
+        {
+            if (AuthController.Instance == null) return;
+            AuthController.Instance.OnRegisterSuccess -= HandleRegisterSuccess;
+            AuthController.Instance.OnRegisterFailed -= HandleRegisterFailed;
         }
 
         private void SetInteraction(bool enabled)
@@ -108,14 +99,8 @@ namespace MXMeet.UI
 
         private void ShowFeedback(string message)
         {
-            if (feedbackText != null)
-            {
-                feedbackText.text = message;
-            }
-            else
-            {
-                Debug.Log(message);
-            }
+            if (feedbackText != null) feedbackText.text = message;
+            else Debug.Log(message);
         }
     }
 }

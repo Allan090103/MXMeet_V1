@@ -38,13 +38,12 @@ namespace XRMultiplayer
         /// <summary>
         /// The list of current messages.
         /// </summary>
-        NetworkList<FixedString512Bytes> messageList;
+        NetworkList<FixedString512Bytes> messageList = new NetworkList<FixedString512Bytes>(default, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
         /// <inheritdoc/>
         void Start()
         {
             XRINetworkGameManager.Connected.Subscribe(ConnectedToNetwork);
-            messageList = new NetworkList<FixedString512Bytes>(default, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
         }
 
         /// <summary>

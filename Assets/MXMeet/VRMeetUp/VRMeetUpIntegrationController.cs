@@ -43,6 +43,13 @@ namespace MXMeet.VRMeetUp
         [Tooltip("Root GameObject that holds the VRMeetUp world content. Will be repositioned to the anchor.")]
         public GameObject vrMeetUpWorldRoot;
 
+        [Tooltip("Spawns the original VRMeetUp UI/world prefabs into the MR anchor area.")]
+        public VRMeetUpAppPresenter appPresenter;
+
+        [Header("Editor Preview")]
+        [Tooltip("Shows a simulated MR room in Editor/Standalone when Quest passthrough is unavailable.")]
+        public bool useMRPreviewInEditor = true;
+
         [Header("VRMeetUp References")]
         [Tooltip("XRINetworkGameManager in the VRMeetUp scene. Assign in Inspector or will be found automatically.")]
         public XRINetworkGameManager networkGameManager;
@@ -57,6 +64,14 @@ namespace MXMeet.VRMeetUp
         // ── State ─────────────────────────────────────────────────────────
         public bool IsConnected        { get; private set; }
         public bool IsPassthroughActive { get; private set; }
+
+        private MRPreviewEnvironment _previewEnvironment;
+        private GameObject _previewAnchorGO;
+        private XRINetworkGameManager _callbackSource;
+        private Vector3 _lastAnchorPosition;
+        private Quaternion _lastAnchorRotation = Quaternion.identity;
+        private bool _hasAnchor;
+        private Coroutine _showAppSurfaceRoutine;
 
 #if META_XR_SDK
         private OVRSpatialAnchor _anchor;
@@ -73,13 +88,6 @@ namespace MXMeet.VRMeetUp
 
         private void Start()
         {
-            // Auto-find XRINetworkGameManager if not assigned
-            if (networkGameManager == null)
-                networkGameManager = FindFirstObjectByType<XRINetworkGameManager>();
-
-            if (networkGameManager == null)
-                Debug.LogWarning("[VRMeetUpIntegration] XRINetworkGameManager not found. Assign it in Inspector.");
-
             // Subscribe to VRMeetUp connection events
             XRINetworkGameManager.Connected.Subscribe(OnVRMeetUpConnectionChanged);
         }
@@ -87,6 +95,7 @@ namespace MXMeet.VRMeetUp
         private void OnDestroy()
         {
             XRINetworkGameManager.Connected.Unsubscribe(OnVRMeetUpConnectionChanged);
+            UnhookNetworkManagerCallbacks();
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -95,6 +104,15 @@ namespace MXMeet.VRMeetUp
         /// <summary>Enables Meta XR Passthrough so the MR user sees their real environment.</summary>
         public void EnablePassthrough()
         {
+            if (ShouldUseMRPreview())
+            {
+                EnsurePreviewEnvironment().Show();
+                IsPassthroughActive = true;
+                Debug.Log("[VRMeetUpIntegration] MR preview environment enabled.");
+                OnPassthroughEnabled?.Invoke();
+                return;
+            }
+
 #if META_XR_SDK
             if (passthroughLayer == null) { OnError?.Invoke("Passthrough layer not assigned in Inspector."); return; }
 
@@ -112,14 +130,16 @@ namespace MXMeet.VRMeetUp
             Debug.Log("[VRMeetUpIntegration] Passthrough enabled.");
             OnPassthroughEnabled?.Invoke();
 #else
-            Debug.LogWarning("[VRMeetUpIntegration] Meta XR SDK not installed. Add META_XR_SDK to Scripting Define Symbols to enable passthrough.");
-            OnError?.Invoke("Meta XR SDK not installed. Passthrough unavailable.");
+            OnError?.Invoke("Passthrough is only available on Quest. Editor preview is disabled.");
 #endif
         }
 
         /// <summary>Disables passthrough and restores camera skybox.</summary>
         public void DisablePassthrough()
         {
+            if (_previewEnvironment != null)
+                _previewEnvironment.Hide();
+
 #if META_XR_SDK
             if (passthroughLayer != null) passthroughLayer.enabled = false;
 #endif
@@ -140,14 +160,32 @@ namespace MXMeet.VRMeetUp
         /// </summary>
         public void PlaceSpatialAnchor()
         {
-            if (spatialAnchorPrefab == null) { OnError?.Invoke("Spatial anchor prefab not assigned."); return; }
-
             Transform cam = Camera.main?.transform;
             if (cam == null) { OnError?.Invoke("No main camera found."); return; }
 
             // Place 1.5m in front, slightly below eye level
             Vector3 pos = cam.position + cam.forward * 1.5f;
             pos.y = cam.position.y - 0.3f;
+
+            if (ShouldUseMRPreview())
+            {
+                _previewAnchorGO = EnsurePreviewEnvironment().PlaceAnchor(pos);
+                _lastAnchorPosition = pos;
+                _lastAnchorRotation = Quaternion.LookRotation(Vector3.back, Vector3.up);
+                _hasAnchor = true;
+
+                if (vrMeetUpWorldRoot != null)
+                {
+                    vrMeetUpWorldRoot.transform.position = pos;
+                    vrMeetUpWorldRoot.SetActive(true);
+                }
+
+                Debug.Log("[VRMeetUpIntegration] Preview anchor placed.");
+                OnAnchorPlaced?.Invoke();
+                return;
+            }
+
+            if (spatialAnchorPrefab == null) { OnError?.Invoke("Spatial anchor prefab not assigned."); return; }
 
 #if META_XR_SDK
             // Remove existing anchor
@@ -169,6 +207,10 @@ namespace MXMeet.VRMeetUp
                 vrMeetUpWorldRoot.transform.position = pos;
                 vrMeetUpWorldRoot.SetActive(true);
             }
+
+            _lastAnchorPosition = pos;
+            _lastAnchorRotation = Quaternion.LookRotation(-cam.forward, Vector3.up);
+            _hasAnchor = true;
 
             StartCoroutine(WaitForAnchor());
         }
@@ -199,9 +241,10 @@ namespace MXMeet.VRMeetUp
         /// then Quick-Joins a VRMeetUp lobby.
         /// This is exactly how a normal VRMeetUp player joins.
         /// </summary>
-        public void ConnectToVRMeetUp()
+        public async void ConnectToVRMeetUp()
         {
-            if (networkGameManager == null) { OnError?.Invoke("XRINetworkGameManager not found."); return; }
+            if (!TryResolveNetworkGameManager()) return;
+            if (!await EnsureVRMeetUpAuthenticated()) return;
 
             // Set player identity in VRMeetUp BEFORE connecting
             string username = MXMeet.Auth.AuthController.Instance?.CurrentUser?.username ?? "MXMeet User";
@@ -221,9 +264,10 @@ namespace MXMeet.VRMeetUp
         /// Joins a specific VRMeetUp room by code.
         /// The room code is the VRMeetUp lobby code, not an MXMeet code.
         /// </summary>
-        public void ConnectToVRMeetUpByCode(string roomCode)
+        public async void ConnectToVRMeetUpByCode(string roomCode)
         {
-            if (networkGameManager == null) { OnError?.Invoke("XRINetworkGameManager not found."); return; }
+            if (!TryResolveNetworkGameManager()) return;
+            if (!await EnsureVRMeetUpAuthenticated()) return;
 
             string username = MXMeet.Auth.AuthController.Instance?.CurrentUser?.username ?? "MXMeet User";
             Color  color    = Color.white;
@@ -250,6 +294,7 @@ namespace MXMeet.VRMeetUp
             DisablePassthrough();
 
             if (vrMeetUpWorldRoot != null) vrMeetUpWorldRoot.SetActive(false);
+            if (appPresenter != null) appPresenter.Hide();
 
 #if META_XR_SDK
             if (_anchor != null) { Destroy(_anchor.gameObject); _anchor = null; }
@@ -270,11 +315,19 @@ namespace MXMeet.VRMeetUp
             if (connected)
             {
                 Debug.Log("[VRMeetUpIntegration] Connected to VRMeetUp.");
-                OnConnectedToVRMeetUp?.Invoke();
+                if (_showAppSurfaceRoutine == null)
+                    _showAppSurfaceRoutine = StartCoroutine(ShowVRMeetUpAppSurfaceWhenReady());
             }
             else
             {
                 Debug.Log("[VRMeetUpIntegration] Disconnected from VRMeetUp.");
+                if (_showAppSurfaceRoutine != null)
+                {
+                    StopCoroutine(_showAppSurfaceRoutine);
+                    _showAppSurfaceRoutine = null;
+                }
+
+                if (appPresenter != null) appPresenter.Hide();
                 OnDisconnectedFromVRMeetUp?.Invoke();
             }
         }
@@ -290,5 +343,148 @@ namespace MXMeet.VRMeetUp
 
         /// <summary>Returns true if VRMeetUp authentication is complete.</summary>
         public bool IsAuthenticated() => networkGameManager?.IsAuthenticated() ?? false;
+
+        private bool TryResolveNetworkGameManager()
+        {
+            if (networkGameManager != null) return true;
+
+            networkGameManager = FindFirstObjectByType<XRINetworkGameManager>();
+            if (networkGameManager != null)
+            {
+                HookNetworkManagerCallbacks();
+                return true;
+            }
+
+#if UNITY_EDITOR
+            MXMeet.EditorBootstrap.EnsureVRMeetUpManagersForEditorTesting();
+            networkGameManager = FindFirstObjectByType<XRINetworkGameManager>();
+            if (networkGameManager != null)
+            {
+                HookNetworkManagerCallbacks();
+                return true;
+            }
+#endif
+
+            string message = "VRMeetUp network manager is not loaded. Start from Bootstrap or open a scene that contains XRI_Network_Game_Manager.";
+            Debug.LogWarning($"[VRMeetUpIntegration] {message}");
+            OnError?.Invoke(message);
+            return false;
+        }
+
+        private void ShowVRMeetUpAppSurface()
+        {
+            EnsureAppPresenter();
+
+            Vector3 position = _hasAnchor
+                ? _lastAnchorPosition
+                : (Camera.main != null ? Camera.main.transform.position + Camera.main.transform.forward * 1.5f : Vector3.zero);
+
+            Quaternion rotation = _hasAnchor ? _lastAnchorRotation : Quaternion.identity;
+            appPresenter.Show(position, rotation);
+        }
+
+        private IEnumerator ShowVRMeetUpAppSurfaceWhenReady()
+        {
+            while (NetworkManager.Singleton == null ||
+                   !NetworkManager.Singleton.IsListening ||
+                   XRINetworkGameManager.CurrentConnectionState.Value != XRINetworkGameManager.ConnectionState.Connected)
+            {
+                yield return null;
+            }
+
+            // Let VRMeetUp finish its host/client startup frame before adding app UI prefabs.
+            yield return null;
+            ShowVRMeetUpAppSurface();
+            _showAppSurfaceRoutine = null;
+            OnConnectedToVRMeetUp?.Invoke();
+        }
+
+        private void EnsureAppPresenter()
+        {
+            if (appPresenter != null) return;
+
+            appPresenter = FindFirstObjectByType<VRMeetUpAppPresenter>();
+            if (appPresenter != null) return;
+
+            GameObject presenterObject = new GameObject("VRMeetUp App Presenter");
+            DontDestroyOnLoad(presenterObject);
+            appPresenter = presenterObject.AddComponent<VRMeetUpAppPresenter>();
+        }
+
+        private void HookNetworkManagerCallbacks()
+        {
+            if (networkGameManager == null || _callbackSource == networkGameManager) return;
+
+            UnhookNetworkManagerCallbacks();
+            networkGameManager.connectionFailedAction += HandleVRMeetUpConnectionFailed;
+            networkGameManager.connectionUpdated += HandleVRMeetUpConnectionUpdated;
+            _callbackSource = networkGameManager;
+        }
+
+        private void UnhookNetworkManagerCallbacks()
+        {
+            if (_callbackSource == null) return;
+
+            _callbackSource.connectionFailedAction -= HandleVRMeetUpConnectionFailed;
+            _callbackSource.connectionUpdated -= HandleVRMeetUpConnectionUpdated;
+            _callbackSource = null;
+        }
+
+        private void HandleVRMeetUpConnectionFailed(string reason)
+        {
+            OnError?.Invoke($"VRMeetUp connection failed: {reason}");
+        }
+
+        private void HandleVRMeetUpConnectionUpdated(string update)
+        {
+            Debug.Log($"[VRMeetUpIntegration] {update}");
+        }
+
+        private async System.Threading.Tasks.Task<bool> EnsureVRMeetUpAuthenticated()
+        {
+#if UNITY_EDITOR
+            MXMeet.EditorBootstrap.EnsureVRMeetUpManagersForEditorTesting();
+#endif
+
+            if (networkGameManager.IsAuthenticated()) return true;
+
+            try
+            {
+                Debug.Log("[VRMeetUpIntegration] Authenticating Unity Gaming Services for VRMeetUp...");
+                bool authenticated = await networkGameManager.Authenticate();
+                if (authenticated) return true;
+
+                string message = "VRMeetUp authentication failed. Check Unity Gaming Services project settings.";
+                Debug.LogWarning($"[VRMeetUpIntegration] {message}");
+                OnError?.Invoke(message);
+                return false;
+            }
+            catch (Exception e)
+            {
+                string message = $"VRMeetUp authentication failed: {e.Message}";
+                Debug.LogWarning($"[VRMeetUpIntegration] {message}");
+                OnError?.Invoke(message);
+                return false;
+            }
+        }
+
+        private bool ShouldUseMRPreview()
+        {
+#if UNITY_EDITOR || UNITY_STANDALONE
+            return useMRPreviewInEditor;
+#else
+            return false;
+#endif
+        }
+
+        private MRPreviewEnvironment EnsurePreviewEnvironment()
+        {
+            if (_previewEnvironment != null) return _previewEnvironment;
+
+            GameObject previewObject = new GameObject("MXMeet MR Preview");
+            DontDestroyOnLoad(previewObject);
+            _previewEnvironment = previewObject.AddComponent<MRPreviewEnvironment>();
+            return _previewEnvironment;
+        }
     }
 }

@@ -48,11 +48,18 @@ namespace MXMeet.UI
 
         private void Start()
         {
+            if (AuthController.Instance == null)
+            {
+                SetError("Authentication system is not ready. Start from Bootstrap.");
+                SetLoading(false);
+                return;
+            }
+
             // Wire up buttons
-            loginButton.onClick.AddListener(OnLoginClicked);
-            registerButton.onClick.AddListener(OnRegisterClicked);
-            switchToRegisterButton.onClick.AddListener(() => ShowPanel(false));
-            switchToLoginButton.onClick.AddListener(() => ShowPanel(true));
+            if (loginButton != null) loginButton.onClick.AddListener(OnLoginClicked);
+            if (registerButton != null) registerButton.onClick.AddListener(OnRegisterClicked);
+            if (switchToRegisterButton != null) switchToRegisterButton.onClick.AddListener(() => ShowPanel(false));
+            if (switchToLoginButton != null) switchToLoginButton.onClick.AddListener(() => ShowPanel(true));
 
             // Subscribe to AuthController events
             AuthController.Instance.OnLoginSuccess    += HandleLoginSuccess;
@@ -77,6 +84,12 @@ namespace MXMeet.UI
         // ── Button Handlers ───────────────────────────────────────────────
         private void OnLoginClicked()
         {
+            if (loginEmailField == null || loginPasswordField == null)
+            {
+                SetError("Login fields are not assigned.");
+                return;
+            }
+
             SetError("");
             string email    = loginEmailField.text.Trim();
             string password = loginPasswordField.text;
@@ -88,11 +101,17 @@ namespace MXMeet.UI
             }
 
             SetLoading(true);
-            AuthController.Instance.Login(email, password);
+            AuthController.Instance?.Login(email, password);
         }
 
         private void OnRegisterClicked()
         {
+            if (registerUsernameField == null || registerEmailField == null || registerPasswordField == null)
+            {
+                SetError("Registration fields are not assigned.");
+                return;
+            }
+
             SetError("");
             string username = registerUsernameField.text.Trim();
             string email    = registerEmailField.text.Trim();
@@ -103,7 +122,7 @@ namespace MXMeet.UI
             if (password.Length < 6)              { SetError("Password must be at least 6 characters."); return; }
 
             SetLoading(true);
-            AuthController.Instance.Register(username, email, password);
+            AuthController.Instance?.Register(username, email, password);
         }
 
         // ── Event Handlers ────────────────────────────────────────────────
@@ -136,8 +155,8 @@ namespace MXMeet.UI
         // ── Helpers ───────────────────────────────────────────────────────
         private void ShowPanel(bool showLogin)
         {
-            loginPanel.SetActive(showLogin);
-            registerPanel.SetActive(!showLogin);
+            if (loginPanel != null) loginPanel.SetActive(showLogin);
+            if (registerPanel != null) registerPanel.SetActive(!showLogin);
             SetError("");
         }
 
@@ -151,8 +170,8 @@ namespace MXMeet.UI
         private void SetLoading(bool loading)
         {
             if (loadingIndicator != null) loadingIndicator.SetActive(loading);
-            loginButton.interactable    = !loading;
-            registerButton.interactable = !loading;
+            if (loginButton != null) loginButton.interactable = !loading;
+            if (registerButton != null) registerButton.interactable = !loading;
         }
     }
 }

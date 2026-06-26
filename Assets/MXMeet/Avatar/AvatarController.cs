@@ -31,6 +31,7 @@ namespace MXMeet.Avatar
 
         private void Start()
         {
+            if (FirebaseManager.Instance == null) return;
             if (FirebaseManager.Instance.IsReady) _db = FirebaseManager.Instance.DB;
             else FirebaseManager.Instance.OnFirebaseReady += () => _db = FirebaseManager.Instance.DB;
         }
@@ -39,8 +40,9 @@ namespace MXMeet.Avatar
         /// <summary>Saves selected skin and colour to Firestore and updates CurrentAvatar.</summary>
         public async void SaveAvatar(string skinType, string colorCode)
         {
-            string userID = AuthController.Instance.CurrentUser?.userID;
+            string userID = AuthController.Instance?.CurrentUser?.userId;
             if (string.IsNullOrEmpty(userID)) { OnAvatarSaveFailed?.Invoke("Not logged in."); return; }
+            if (_db == null) { OnAvatarSaveFailed?.Invoke("Firestore is not ready."); return; }
 
             try
             {
@@ -50,7 +52,7 @@ namespace MXMeet.Avatar
                          .Document(userID)
                          .SetAsync(avatar.ToDictionary(), SetOptions.MergeAll);
 
-                AuthController.Instance.UpdateCurrentAvatar(avatar);
+                AuthController.Instance?.UpdateCurrentAvatar(avatar);
 
                 Debug.Log($"[AvatarController] Avatar saved: skin={skinType}, color={colorCode}");
                 OnAvatarSaved?.Invoke(avatar);
@@ -66,8 +68,9 @@ namespace MXMeet.Avatar
         /// <summary>Loads avatar settings for the current user from Firestore.</summary>
         public async Task<AvatarModel> LoadAvatar()
         {
-            string userID = AuthController.Instance.CurrentUser?.userID;
+            string userID = AuthController.Instance?.CurrentUser?.userId;
             if (string.IsNullOrEmpty(userID)) return null;
+            if (_db == null) return null;
 
             try
             {
@@ -109,8 +112,8 @@ namespace MXMeet.Models
         public Dictionary<string, object> ToDictionary()
             => new Dictionary<string, object>
             {
-                { "avatarID",   avatarID   },
-                { "userID",     userID     },
+                { "avatarId",   avatarId   },
+                { "userId",     userId     },
                 { "skinType",   skinType   },
                 { "colorCode",  colorCode  },
                 { "updatedAt",  updatedAt  },

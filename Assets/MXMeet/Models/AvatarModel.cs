@@ -1,22 +1,36 @@
 using System;
+using Firebase.Firestore;
 
 namespace MXMeet.Models
 {
     [Serializable]
+    [FirestoreData]
     public partial class AvatarModel
     {
-        public string avatarID;
-        public string userID;
-        public string skinType;
-        public string colorCode;
-        public string updatedAt;
+        [FirestoreProperty] public string avatarId  { get; set; }
+        [FirestoreProperty] public string userId    { get; set; }
+        [FirestoreProperty] public string skinType  { get; set; }
+        [FirestoreProperty] public string colorCode { get; set; }
+        [FirestoreProperty] public string updatedAt { get; set; }
+
+        public string avatarID
+        {
+            get => avatarId;
+            set => avatarId = value;
+        }
+
+        public string userID
+        {
+            get => userId;
+            set => userId = value;
+        }
 
         public AvatarModel() { }
 
-        public AvatarModel(string userID, string skinType, string colorCode)
+        public AvatarModel(string userId, string skinType, string colorCode)
         {
-            this.avatarID  = Guid.NewGuid().ToString();
-            this.userID    = userID;
+            this.avatarId  = userId;
+            this.userId    = userId;
             this.skinType  = skinType;
             this.colorCode = colorCode;
             this.updatedAt = DateTime.UtcNow.ToString("o");

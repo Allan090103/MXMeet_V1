@@ -185,6 +185,8 @@ namespace XRMultiplayer
         ///<inheritdoc/>
         protected virtual void Update()
         {
+            if (m_HeadOrigin == null) return;
+
             if (IsOwner && XRINetworkGameManager.Instance.positionalVoiceChat)
             {
                 if (Time.time > m_VoicePositionCheckTimer)
@@ -194,7 +196,7 @@ namespace XRMultiplayer
                     if (Vector3.Distance(m_PrevHeadPos, m_HeadOrigin.position) > m_VoiceUpdatePosotionDelta)
                     {
                         m_PrevHeadPos = m_HeadOrigin.position;
-                        if (XRINetworkGameManager.Instance.positionalVoiceChat)
+                        if (XRINetworkGameManager.Instance.positionalVoiceChat && m_VoiceChat != null)
                         {
                             m_VoiceChat.Set3DAudio(m_HeadOrigin);
                         }
@@ -209,6 +211,8 @@ namespace XRMultiplayer
         protected virtual void LateUpdate()
         {
             if (!IsOwner) return;
+            if (m_LeftHandOrigin == null || m_RightHandOrigin == null || m_HeadOrigin == null) return;
+            if (leftHand == null || rightHand == null || head == null) return;
 
             // Set transforms to be replicated with ClientNetworkTransforms
             leftHand.SetPositionAndRotation(m_LeftHandOrigin.position, m_LeftHandOrigin.rotation);
@@ -226,7 +230,8 @@ namespace XRMultiplayer
                 // Local Name unsubscribe.
                 XRINetworkGameManager.LocalPlayerName.Unsubscribe(UpdateLocalPlayerName);
                 XRINetworkGameManager.LocalPlayerColor.Unsubscribe(UpdateLocalPlayerColor);
-                m_VoiceChat.selfMuted.Unsubscribe(SelfMutedChanged);
+                if (m_VoiceChat != null)
+                    m_VoiceChat.selfMuted.Unsubscribe(SelfMutedChanged);
             }
             else if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsConnectedClient)
             {
@@ -254,10 +259,17 @@ namespace XRMultiplayer
                 {
                     m_HeadOrigin = m_XROrigin.Camera.transform;
                 }
+                else if (Camera.main != null)
+                {
+                    m_HeadOrigin = Camera.main.transform;
+                }
                 else
                 {
                     Utils.Log("No XR Rig Available", 1);
                 }
+
+                if (m_LeftHandOrigin == null) m_LeftHandOrigin = m_HeadOrigin;
+                if (m_RightHandOrigin == null) m_RightHandOrigin = m_HeadOrigin;
 
                 SetupLocalPlayer();
             }
@@ -267,7 +279,7 @@ namespace XRMultiplayer
         public override void OnNetworkDespawn()
         {
             base.OnNetworkDespawn();
-            PlayerHudNotification.Instance.ShowText($"<b>{m_PlayerName.Value}</b> left");
+            PlayerHudNotification.Instance?.ShowText($"<b>{m_PlayerName.Value}</b> left");
             onDisconnected?.Invoke(this);
         }
 
@@ -299,8 +311,11 @@ namespace XRMultiplayer
             m_PlayerName.Value = new FixedString128Bytes(XRINetworkGameManager.LocalPlayerName.Value);
             XRINetworkGameManager.LocalPlayerColor.Subscribe(UpdateLocalPlayerColor);
             XRINetworkGameManager.LocalPlayerName.Subscribe(UpdateLocalPlayerName);
-            m_VoiceChat.selfMuted.Subscribe(SelfMutedChanged);
-            m_VoiceChat.ToggleSelfMute(true, true);
+            if (m_VoiceChat != null)
+            {
+                m_VoiceChat.selfMuted.Subscribe(SelfMutedChanged);
+                m_VoiceChat.ToggleSelfMute(true, true);
+            }
 
             onSpawnedLocal?.Invoke();
         }
@@ -374,7 +389,7 @@ namespace XRMultiplayer
             {
                 m_InitialConnected = true;
                 if (!IsLocalPlayer)
-                    PlayerHudNotification.Instance.ShowText($"<b>{playerName}</b> joined");
+                    PlayerHudNotification.Instance?.ShowText($"<b>{playerName}</b> joined");
             }
 
             if (m_UpdateObjectName)

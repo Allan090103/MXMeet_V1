@@ -21,9 +21,6 @@ EditorBuildSettings:
     path: Assets/Scenes/MXMeet/Lobby.unity
     guid: 9f09a2f5e6ae6274fa2d7c2f322a3b5c
   - enabled: 1
-    path: Assets/Scenes/MXMeet/Notepad.unity
-    guid: d4a544261c0abc041862d9168f93dc8e
-  - enabled: 1
     path: Assets/Scenes/MXMeet/MRView.unity
     guid: b8f3575482efb104b93fc1d1ede9af5e
   m_configObjects:
